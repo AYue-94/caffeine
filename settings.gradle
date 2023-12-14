@@ -20,9 +20,9 @@ plugins {
 rootProject.name = 'caffeine'
 
 include 'caffeine'
-include 'guava'
-include 'jcache'
-include 'simulator'
+//include 'guava'
+//include 'jcache'
+//include 'simulator'
 
 // Note: we need to verify the checksum for checksum-dependency-plugin itself
 def expectedSha512 = [
