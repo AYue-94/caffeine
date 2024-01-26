@@ -64,10 +64,13 @@ import com.google.errorprone.annotations.Immutable;
 public final class CacheStats {
   private static final CacheStats EMPTY_STATS = CacheStats.of(0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
+  // 缓存（未）命中次数
   private final long hitCount;
   private final long missCount;
+  // mappingFunction/CacheLoader 加载成功（失败）次数
   private final long loadSuccessCount;
   private final long loadFailureCount;
+  //
   private final long totalLoadTime;
   private final long evictionCount;
   private final long evictionWeight;

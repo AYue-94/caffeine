@@ -118,6 +118,7 @@ final class FrequencySketch<E> {
     for (int i = 0; i < 4; i++) {
       int index = indexOf(hash, i);
       int count = (int) ((table[index] >>> ((start + i) << 2)) & 0xfL);
+      // 取4个counter中最小的作为频率返回值
       frequency = Math.min(frequency, count);
     }
     return frequency;
@@ -134,10 +135,10 @@ final class FrequencySketch<E> {
     if (isNotInitialized()) {
       return;
     }
-
+    // hash
     int hash = spread(e.hashCode());
+    // (hash & 11) << 2  ---> 0 ~ 12
     int start = (hash & 3) << 2;
-
     // Loop unrolling improves throughput by 5m ops/s
     int index0 = indexOf(hash, 0);
     int index1 = indexOf(hash, 1);
@@ -149,23 +150,24 @@ final class FrequencySketch<E> {
     added |= incrementAt(index2, start + 2);
     added |= incrementAt(index3, start + 3);
 
+    // 采集数量 到达 max * 10
     if (added && (++size == sampleSize)) {
-      reset();
+      reset(); // reset 采集数量都减半
     }
   }
 
   /**
    * Increments the specified counter by 1 if it is not already at the maximum value (15).
    *
-   * @param i the table index (16 counters)
-   * @param j the counter to increment
+   * @param i the table index (16 counters) table下标
+   * @param j the counter to increment 0-15
    * @return if incremented
    */
   boolean incrementAt(int i, int j) {
-    int offset = j << 2;
-    long mask = (0xfL << offset);
-    if ((table[i] & mask) != mask) {
-      table[i] += (1L << offset);
+    int offset = j << 2; // 0-15 * 4 => 0 - 60
+    long mask = (0xfL << offset); // 1111 << offset
+    if ((table[i] & mask) != mask) { // 未到达15
+      table[i] += (1L << offset); // +1
       return true;
     }
     return false;

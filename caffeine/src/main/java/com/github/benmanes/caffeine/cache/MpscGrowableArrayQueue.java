@@ -273,11 +273,11 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     long pIndex;
 
     while (true) {
-      long producerLimit = lvProducerLimit();
-      pIndex = lvProducerIndex();
+      long producerLimit = lvProducerLimit(); // 写limit
+      pIndex = lvProducerIndex(); // 写index
       // lower bit is indicative of resize, if we see it we spin until it's cleared
       if ((pIndex & 1) == 1) {
-        continue;
+        continue; // 如果正在扩容，自旋
       }
       // pIndex is even (lower bit is 0) -> actual index is (pIndex >> 1)
 
@@ -290,13 +290,13 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
       if (producerLimit <= pIndex) {
         int result = offerSlowPath(mask, pIndex, producerLimit);
         switch (result) {
-          case 0:
+          case 0: // pIndex < producerLimit
             break;
           case 1:
             continue;
-          case 2:
+          case 2: // 写满了
             return false;
-          case 3:
+          case 3: // 写buffer扩容
             resize(mask, buffer, pIndex, e);
             return true;
         }

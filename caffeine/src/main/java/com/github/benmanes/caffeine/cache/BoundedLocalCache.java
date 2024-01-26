@@ -211,11 +211,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   /** The maximum duration before an entry expires. */
   static final long MAXIMUM_EXPIRY = (Long.MAX_VALUE >> 1); // 150 years
 
+  // write mpsc queue，
   final MpscGrowableArrayQueue<Runnable> writeBuffer;
   final ConcurrentHashMap<Object, Node<K, V>> data;
   @Nullable final CacheLoader<K, V> cacheLoader;
   final PerformCleanupTask drainBuffersTask;
   final Consumer<Node<K, V>> accessPolicy;
+  // read mpsc buffer，区别于queue/stack，不保证顺序
   final Buffer<Node<K, V>> readBuffer;
   final NodeFactory<K, V> nodeFactory;
   final ReentrantLock evictionLock;
@@ -579,8 +581,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
 
     long max = Math.min(maximum, MAXIMUM_CAPACITY);
-    long window = max - (long) (PERCENT_MAIN * max);
-    long mainProtected = (long) (PERCENT_MAIN_PROTECTED * (max - window));
+    long window = max - (long) (PERCENT_MAIN/*0.99*/ * max); // window区域 = max * 1%
+    long mainProtected = (long) (PERCENT_MAIN_PROTECTED/*0.8*/ * (max - window)); // main protected区域 = (max - window区域) * 80%
 
     setMaximum(max);
     setWindowMaximum(window);
@@ -588,7 +590,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
     setHitsInSample(0);
     setMissesInSample(0);
-    setStepSize(-HILL_CLIMBER_STEP_PERCENT * max);
+    setStepSize(-HILL_CLIMBER_STEP_PERCENT * max); // stepSize = -0.0625 * max
 
     if ((frequencySketch() != null) && !isWeighted() && (weightedSize() >= (max >>> 1))) {
       // Lazily initialize when close to the maximum size
@@ -602,21 +604,23 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     if (!evicts()) {
       return;
     }
+    // window超容量 window.head -> probation.tail
     int candidates = evictFromWindow();
+    // pk
     evictFromMain(candidates);
   }
 
   /**
    * Evicts entries from the window space into the main space while the window size exceeds a
    * maximum.
-   *
-   * @return the number of candidate entries evicted from the window space
+   * window容量超限，将node从window头部 驱逐到main区域 尾部
+   * @return the number of candidate entries evicted from the window space 驱逐node个数
    */
   @GuardedBy("evictionLock")
   int evictFromWindow() {
     int candidates = 0;
-    Node<K, V> node = accessOrderWindowDeque().peek();
-    while (windowWeightedSize() > windowMaximum()) {
+    Node<K, V> node = accessOrderWindowDeque().peek(); // 从window头开始处理
+    while (windowWeightedSize() > windowMaximum()) { // window溢出
       // The pending operations will adjust the size to reflect the correct weight
       if (node == null) {
         break;
@@ -648,11 +652,19 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * eviction is required. The number of remaining candidates is provided and decremented on
    * eviction, so that when there are no more candidates the victim is evicted.
    *
+   * probation.head（A）vs 刚晋升的probation.tail（B）
+   * 如果B == null
+   * 	probation.head（A）vs window.tail（C）
+   * 	如果C == null ，则A == null，从protected.head开始淘汰
+   * 	如果A == null ，则C == null，从protected.head开始淘汰
+   * 如果A == null，则B == null，则window.tail（C）== null
+   * 	从protected.head开始淘汰
+   *
    * @param candidates the number of candidate entries evicted from the window space
    */
   @GuardedBy("evictionLock")
   void evictFromMain(int candidates) {
-    int victimQueue = PROBATION;
+    int victimQueue = PROBATION; // probation -> protected -> window
     Node<K, V> victim = accessOrderProbationDeque().peekFirst();
     Node<K, V> candidate = accessOrderProbationDeque().peekLast();
     while (weightedSize() > maximum()) {
@@ -662,6 +674,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       }
 
       // Try evicting from the protected and window queues
+
+      // 两个队列都被干完 victim 切换
       if ((candidate == null) && (victim == null)) {
         if (victimQueue == PROBATION) {
           victim = accessOrderProtectedDeque().peekFirst();
@@ -677,6 +691,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         break;
       }
 
+      // 0权重
       // Skip over entries with zero weight
       if ((victim != null) && (victim.getPolicyWeight() == 0)) {
         victim = victim.getNextInAccessOrder();
@@ -689,6 +704,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         continue;
       }
 
+      // 有一个队列被干完，另一个队列的node被驱逐
       // Evict immediately if only one of the entries is present
       if (victim == null) {
         @SuppressWarnings("NullAway")
@@ -705,6 +721,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         continue;
       }
 
+      // key value被gc
       // Evict immediately if an entry was collected
       K victimKey = victim.getKey();
       K candidateKey = candidate.getKey();
@@ -735,13 +752,15 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       }
 
       // Evict the entry with the lowest frequency
+
+      // 本轮晋升的window 与
       candidates--;
-      if (admit(candidateKey, victimKey)) {
+      if (admit(candidateKey, victimKey)) { // victim失败 old key 被驱逐
         Node<K, V> evict = victim;
         victim = victim.getNextInAccessOrder();
         evictEntry(evict, RemovalCause.SIZE, 0L);
         candidate = candidate.getPreviousInAccessOrder();
-      } else {
+      } else { // candidate失败 new key被驱逐
         Node<K, V> evict = candidate;
         candidate = (candidates > 0)
             ? candidate.getPreviousInAccessOrder()
@@ -765,16 +784,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   boolean admit(K candidateKey, K victimKey) {
     int victimFreq = frequencySketch().frequency(victimKey);
     int candidateFreq = frequencySketch().frequency(candidateKey);
-    if (candidateFreq > victimFreq) {
-      return true;
-    } else if (candidateFreq <= 5) {
+    if (candidateFreq > victimFreq) { // candidate频率高
+      return true; // victim被驱逐
+    } else if (candidateFreq <= 5) { // candidate频率低，且candidate频率不超过5
       // The maximum frequency is 15 and halved to 7 after a reset to age the history. An attack
       // exploits that a hot candidate is rejected in favor of a hot victim. The threshold of a warm
       // candidate reduces the number of random acceptances to minimize the impact on the hit rate.
-      return false;
+      return false; // candidate被驱逐
     }
     int random = ThreadLocalRandom.current().nextInt();
-    return ((random & 127) == 0);
+    return ((random & 127) == 0); // candidate频率低，且candidate频率超过5，按照概率驱逐
   }
 
   /** Expires entries that have expired by access, write, or variable. */
@@ -785,6 +804,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     expireAfterWriteEntries(now);
     expireVariableEntries(now);
 
+    // 忽略
     Pacer pacer = pacer();
     if (pacer != null) {
       long delay = getExpirationDelay(now);
@@ -816,8 +836,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     long duration = expiresAfterAccessNanos();
     for (;;) {
       Node<K, V> node = accessOrderDeque.peekFirst();
-      if ((node == null) || ((now - node.getAccessTime()) < duration)
-          || !evictEntry(node, RemovalCause.EXPIRED, now)) {
+      if ((node == null) // 队列空了
+          || ((now - node.getAccessTime()) < duration) // 还未到过期时间
+          || !evictEntry(node, RemovalCause.EXPIRED, now)) { // 由于其他原因，key过期失败
         return;
       }
     }
@@ -1000,15 +1021,19 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     if (!evicts()) {
       return;
     }
-
+    // 计算window调整大小
     determineAdjustment();
+    // protected区域溢出，将protected从头到尾 降级 probation
     demoteFromMainProtected();
+    // 调整值
     long amount = adjustment();
     if (amount == 0) {
       return;
     } else if (amount > 0) {
+      // 收缩protected，扩张window，按照probation->protected从头到尾的顺序，降级node到window
       increaseWindow();
     } else {
+      // 收缩window，扩张protected，按照window从头到尾的顺序，将node升级到probation
       decreaseWindow();
     }
   }
@@ -1022,21 +1047,25 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       setHitsInSample(0);
       return;
     }
-
-    int requestCount = hitsInSample() + missesInSample();
-    if (requestCount < frequencySketch().sampleSize) {
+    // 总请求数量 = onAccess + AddTask
+    int requestCount = hitsInSample()/*onAccess*/ + missesInSample()/*AddTask*/;
+    if (requestCount < frequencySketch().sampleSize) { // 采样数量到达10*max 才调整窗口
       return;
     }
-
+    // 命中率 = onAccess / (onAccess + AddTask)
     double hitRate = (double) hitsInSample() / requestCount;
+    // 命中率变化
     double hitRateChange = hitRate - previousSampleHitRate();
+    // 窗口调整值 = 命中率增加 ？ 步长 ：-步长
     double amount = (hitRateChange >= 0) ? stepSize() : -stepSize();
+    // 命中率变化超过0.05 ？stepSize = 0.0625 * max : stepSize = 0.98 * amount
     double nextStepSize = (Math.abs(hitRateChange) >= HILL_CLIMBER_RESTART_THRESHOLD)
         ? HILL_CLIMBER_STEP_PERCENT * maximum() * (amount >= 0 ? 1 : -1)
         : HILL_CLIMBER_STEP_DECAY_RATE * amount;
     setPreviousSampleHitRate(hitRate);
     setAdjustment((long) amount);
     setStepSize(nextStepSize);
+    // 清空采样次数
     setMissesInSample(0);
     setHitsInSample(0);
   }
@@ -1054,11 +1083,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       return;
     }
 
+    // 一般quota就是adjustment窗口调整值
     long quota = Math.min(adjustment(), mainProtectedMaximum());
+    // 收缩protected，扩张window
     setMainProtectedMaximum(mainProtectedMaximum() - quota);
     setWindowMaximum(windowMaximum() + quota);
+
+    // 由于protected被收缩，有可能溢出，再次尝试 降级 protected.head到probation.tail
     demoteFromMainProtected();
 
+    // 按照probation.head -> probation.tail -> protected.head -> protected.tail的顺序将node降级到window.tail
     for (int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
       Node<K, V> candidate = accessOrderProbationDeque().peek();
       boolean probation = true;
@@ -1127,6 +1161,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   }
 
   /** Transfers the nodes from the protected to the probation region if it exceeds the maximum. */
+  // protected区域溢出，将protected.head 降级 probation.tail
   @GuardedBy("evictionLock")
   void demoteFromMainProtected() {
     long mainProtectedMaximum = mainProtectedMaximum();
@@ -1160,14 +1195,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    */
   void afterRead(Node<K, V> node, long now, boolean recordHit) {
     if (recordHit) {
-      statsCounter().recordHits(1);
+      statsCounter().recordHits(1); /*recordStats特性*/
     }
 
+    // node放入读buffer
     boolean delayable = skipReadBuffer() || (readBuffer.offer(node) != Buffer.FULL);
+    // 按需唤起maintenance
     if (shouldDrainBuffers(delayable)) {
       scheduleDrainBuffers();
     }
-    refreshIfNeeded(node, now);
+    refreshIfNeeded(node, now); /*refreshAfterWrite特性*/
   }
 
   /** Returns if the cache should bypass the read buffer. */
@@ -1183,16 +1220,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    */
   @SuppressWarnings("FutureReturnValueIgnored")
   void refreshIfNeeded(Node<K, V> node, long now) {
-    if (!refreshAfterWrite()) {
+    if (!refreshAfterWrite()) { // 未开启refreshAfterWrite
       return;
     }
     K key;
     V oldValue;
     long oldWriteTime = node.getWriteTime();
-    long refreshWriteTime = (now + ASYNC_EXPIRY);
-    if (((now - oldWriteTime) > refreshAfterWriteNanos())
-        && ((key = node.getKey()) != null) && ((oldValue = node.getValue()) != null)
-        && node.casWriteTime(oldWriteTime, refreshWriteTime)) {
+    long refreshWriteTime = (now + ASYNC_EXPIRY); // now + 220年
+    if (((now - oldWriteTime) > refreshAfterWriteNanos()) // 到达刷新时间
+        && ((key = node.getKey()) != null) && ((oldValue = node.getValue()) != null) // 确认未gc
+        && node.casWriteTime(oldWriteTime, refreshWriteTime)) { // cas替换node的写时间，能确保单线程刷新
       try {
         CompletableFuture<V> refreshFuture;
         long startTime = statsTicker().read();
@@ -1211,6 +1248,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           }
         } else {
           @SuppressWarnings("NullAway")
+              // 提交到 指定executor 调用reload方法（load方法）
           CompletableFuture<V> refresh = cacheLoader.asyncReload(key, oldValue, executor);
           refreshFuture = refresh;
         }
@@ -1220,6 +1258,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
             if (!(error instanceof CancellationException) && !(error instanceof TimeoutException)) {
               logger.log(Level.WARNING, "Exception thrown during refresh", error);
             }
+            // 刷新失败，写时间替换为原来的时间，直接返回
             node.casWriteTime(refreshWriteTime, oldWriteTime);
             statsCounter().recordLoadFailure(loadTime);
             return;
@@ -1231,10 +1270,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           boolean[] discard = new boolean[1];
           compute(key, (k, currentValue) -> {
             if (currentValue == null) {
-              return value;
+              return value; // 当前缓存为空，不管，设置为新value
             } else if ((currentValue == oldValue) && (node.getWriteTime() == refreshWriteTime)) {
-              return value;
+              return value; // 刷新期间，缓存未变更，设置为新value
             }
+            // 刷新期间，缓存发生变更，且非null，使用当前value，新value被丢弃
             discard[0] = true;
             return currentValue;
           }, /* recordMiss */ false, /* recordLoad */ false, /* recordLoadFailure */ true);
@@ -1419,18 +1459,23 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * replacement policy. If the executor rejects the task then it is run directly.
    */
   void scheduleDrainBuffers() {
+    // 如果已经在处理，忽略
     if (drainStatus() >= PROCESSING_TO_IDLE) {
       return;
     }
     if (evictionLock.tryLock()) {
       try {
         int drainStatus = drainStatus();
+        // 如果已经在处理，忽略
         if (drainStatus >= PROCESSING_TO_IDLE) {
           return;
         }
+        // 标记处理中，提交maintenance任务
         lazySetDrainStatus(PROCESSING_TO_IDLE);
+        // 提交maintenance任务
         executor.execute(drainBuffersTask);
       } catch (Throwable t) {
+        // 提交报错，当前线程处理
         logger.log(Level.WARNING, "Exception thrown when submitting maintenance task", t);
         maintenance(/* ignored */ null);
       } finally {
@@ -1478,19 +1523,32 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     lazySetDrainStatus(PROCESSING_TO_IDLE);
 
     try {
-      drainReadBuffer();
 
+      // AddTask: node 移动到 window.tail
+      // Read/UpdateTask:
+      // case1 node在window区 -> 移动到window.tail
+      // case2 node在probation区 -> 【晋升】protected.tail
+      // case3 node在protected区 -> 移动到protected.tail
+       // 处理 readBuffer 读任务
+      drainReadBuffer();
+      // 处理 writeBuffer 写任务
       drainWriteBuffer();
       if (task != null) {
         task.run();
       }
-
+      // key value特性
       drainKeyReferences();
       drainValueReferences();
 
+      // 过期处理
       expireEntries();
+
+      // 超出容量
+      // window超容量 window.head -> 【晋升】probation.tail
+      // pk
       evictEntries();
 
+      // 容量限制：调整窗口、队列
       climb();
     } finally {
       if ((drainStatus() != PROCESSING_TO_IDLE) || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
@@ -1547,16 +1605,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       if (key == null) {
         return;
       }
+      // S1 update/read 更新采集key频率
       frequencySketch().increment(key);
+
+      // S2 node在不同区域的处理
       if (node.inWindow()) {
-        reorder(accessOrderWindowDeque(), node);
+        reorder(accessOrderWindowDeque(), node); // 移动到window队尾
       } else if (node.inMainProbation()) {
-        reorderProbation(node);
+        reorderProbation(node); // 晋升 从probation移动到protected队尾
       } else {
-        reorder(accessOrderProtectedDeque(), node);
+        reorder(accessOrderProtectedDeque(), node); // 移动到protected队尾
       }
       setHitsInSample(hitsInSample() + 1);
-    } else if (expiresAfterAccess()) {
+    }
+    else if (expiresAfterAccess()) {
       reorder(accessOrderWindowDeque(), node);
     }
     if (expiresVariable()) {
@@ -1647,11 +1709,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     @SuppressWarnings("FutureReturnValueIgnored")
     public void run() {
       if (evicts()) {
+        // S1 size更新
         long weightedSize = weightedSize();
         setWeightedSize(weightedSize + weight);
         setWindowWeightedSize(windowWeightedSize() + weight);
         node.setPolicyWeight(node.getPolicyWeight() + weight);
 
+        // S2 size到达max一半 初始化/扩容 FrequencySketch底层table
         long maximum = maximum();
         if (weightedSize >= (maximum >>> 1)) {
           // Lazily initialize when close to the maximum
@@ -1659,6 +1723,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           frequencySketch().ensureCapacity(capacity);
         }
 
+        // S3 采集key频率
         K key = node.getKey();
         if (key != null) {
           frequencySketch().increment(key);
@@ -1673,15 +1738,19 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         isAlive = node.isAlive();
       }
       if (isAlive) {
+        // expireAfterWrite，进入write队尾
         if (expiresAfterWrite()) {
           writeOrderDeque().add(node);
         }
-        if (evicts() && (weight > windowMaximum())) {
+        // S4 加入window队列，一般是队尾
+        if (evicts() && (weight > windowMaximum())) { // 特殊情况 新entry权重直接超过window大小
           accessOrderWindowDeque().offerFirst(node);
         } else if (evicts() || expiresAfterAccess()) {
+          // max/expiresAfterAccess加入access window队尾
           accessOrderWindowDeque().offerLast(node);
         }
         if (expiresVariable()) {
+          // 自定义Expire进入时间轮
           timerWheel().schedule(node);
         }
       }
@@ -1743,6 +1812,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     @Override
     @GuardedBy("evictionLock")
     public void run() {
+      // 通常情况下，evicts做两件事情
+      // 1. 更新node、window、protected、size
+      // 2. 触发onAccess，更新频率，移动node所在区域（window/probation/protected)
       if (evicts()) {
         int oldWeightedSize = node.getPolicyWeight();
         node.setPolicyWeight(oldWeightedSize + weightDifference);
@@ -1750,22 +1822,22 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           if (node.getPolicyWeight() <= windowMaximum()) {
             onAccess(node);
           } else if (accessOrderWindowDeque().contains(node)) {
-            accessOrderWindowDeque().moveToFront(node);
+            accessOrderWindowDeque().moveToFront(node); // 移动到Window队列头部
           }
           setWindowWeightedSize(windowWeightedSize() + weightDifference);
         } else if (node.inMainProbation()) {
             if (node.getPolicyWeight() <= maximum()) {
               onAccess(node);
-            } else if (accessOrderProbationDeque().remove(node)) {
-              accessOrderWindowDeque().addFirst(node);
+            } else if (accessOrderProbationDeque().remove(node)) { // 出Probation队列
+              accessOrderWindowDeque().addFirst(node); // 移动到Window队列头部
               setWindowWeightedSize(windowWeightedSize() + node.getPolicyWeight());
             }
         } else if (node.inMainProtected()) {
           if (node.getPolicyWeight() <= maximum()) {
             onAccess(node);
             setMainProtectedWeightedSize(mainProtectedWeightedSize() + weightDifference);
-          } else if (accessOrderProtectedDeque().remove(node)) {
-            accessOrderWindowDeque().addFirst(node);
+          } else if (accessOrderProtectedDeque().remove(node)) { // 出Protected队列
+            accessOrderWindowDeque().addFirst(node); // 移动到Window队列头部
             setWindowWeightedSize(windowWeightedSize() + node.getPolicyWeight());
             setMainProtectedWeightedSize(mainProtectedWeightedSize() - oldWeightedSize);
           } else {
@@ -1773,13 +1845,14 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           }
         }
         setWeightedSize(weightedSize() + weightDifference);
-      } else if (expiresAfterAccess()) {
-        onAccess(node);
+      }
+      else if (expiresAfterAccess()) {
+        onAccess(node); // 放到window队尾
       }
       if (expiresAfterWrite()) {
-        reorder(writeOrderDeque(), node);
+        reorder(writeOrderDeque(), node); // 放到write队尾
       } else if (expiresVariable()) {
-        timerWheel().reschedule(node);
+        timerWheel().reschedule(node); // 取出来，重新入时间轮
       }
     }
   }
@@ -1910,7 +1983,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
   @Override
   public @Nullable V getIfPresent(Object key, boolean recordStats) {
-    Node<K, V> node = data.get(nodeFactory.newLookupKey(key));
+    Node<K, V> node = data.get(nodeFactory.newLookupKey(key)/*key特性*/);
+    // case1 node为空，缓存不存在，返回null
     if (node == null) {
       if (recordStats) {
         statsCounter().recordMisses(1);
@@ -1921,9 +1995,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       return null;
     }
 
+    // case2 node非空，value 过期/被gc，返回null
     V value = node.getValue();
     long now = expirationTicker().read();
-    if (hasExpired(node, now) || (collectValues() && (value == null))) {
+    if (hasExpired(node, now)/*expire特性*/ || (collectValues() && (value == null))/*value特性*/) {
       if (recordStats) {
         statsCounter().recordMisses(1);
       }
@@ -1931,12 +2006,15 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       return null;
     }
 
+    // case3 node非空，value 正常，返回value
     if (!isComputingAsync(node)) {
       @SuppressWarnings("unchecked")
       K castedKey = (K) key;
+      // 记录访问时间
       setAccessTime(node, now);
       tryExpireAfterRead(node, castedKey, value, expiry(), now);
     }
+    // node进入buffer
     afterRead(node, now, recordStats);
     return value;
   }
@@ -2359,21 +2437,27 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
   }
 
+  /**
+   * Cache#get(key,mappingFunction)
+   * LoadingCache#get(key)
+   * 底层实现
+   */
   @Override
   public @Nullable V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
       boolean recordStats, boolean recordLoad) {
     requireNonNull(key);
     requireNonNull(mappingFunction);
-    long now = expirationTicker().read();
+    long now = expirationTicker().read();/*ticker特性*/
 
     // An optimistic fast path to avoid unnecessary locking
-    Node<K, V> node = data.get(nodeFactory.newLookupKey(key));
+    // Case1 fast-path 无锁 key对应value未gc且未过期，返回value
+    Node<K, V> node = data.get(nodeFactory.newLookupKey(key)/*weakKey特性*/);
     if (node != null) {
       V value = node.getValue();
-      if ((value != null) && !hasExpired(node, now)) {
-        if (!isComputingAsync(node)) {
-          tryExpireAfterRead(node, key, value, expiry(), now);
-          setAccessTime(node, now);
+      if ((value != null)/*value特性*/ && !hasExpired(node, now)/*expire特性*/) {
+        if (!isComputingAsync(node)/*同步api*/) {
+          tryExpireAfterRead(node, key, value, expiry(), now);/*expire特性*/
+          setAccessTime(node, now);/*expire特性*/
         }
 
         afterRead(node, now, /* recordHit */ recordStats);
@@ -2384,6 +2468,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       mappingFunction = statsAware(mappingFunction, recordLoad);
     }
     Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
+
+    // Case2 其他情况，如value不存在，value过期
     return doComputeIfAbsent(key, keyRef, mappingFunction, new long[] { now }, recordStats);
   }
 
@@ -2401,51 +2487,66 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
     int[] weight = new int[2]; // old, new
     RemovalCause[] cause = new RemovalCause[1];
+    // S1，key锁（concurrentHashMap）
     Node<K, V> node = data.compute(keyRef, (k, n) -> {
+      // S2 case1 value不存在
       if (n == null) {
+        // S2-1，用户查询逻辑
         newValue[0] = mappingFunction.apply(key);
-        if (newValue[0] == null) {
+        if (newValue[0] == null) { // 用户返回null
           return null;
         }
-        now[0] = expirationTicker().read();
-        weight[1] = weigher.weigh(key, newValue[0]);
-        n = nodeFactory.newNode(key, keyReferenceQueue(),
-            newValue[0], valueReferenceQueue(), weight[1], now[0]);
-        setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));
-        return n;
+        // S2-2，特性处理，返回新node
+        now[0] = expirationTicker().read(); /*ticker特性*/
+        weight[1] = weigher.weigh(key, newValue[0]); /*weigher特性*/
+        n = nodeFactory.newNode(key, keyReferenceQueue() /*key特性*/,
+            newValue[0], valueReferenceQueue() /*value特性*/, weight[1], now[0]);
+        setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));/*expire特性*/
+        return n; // data注入新value
       }
 
+      // S3 case2 value存在，node锁
       synchronized (n) {
+        // S3-1，过期、弱key、软/弱value
         nodeKey[0] = n.getKey();
         weight[0] = n.getWeight();
         oldValue[0] = n.getValue();
-        if ((nodeKey[0] == null) || (oldValue[0] == null)) {
-          cause[0] = RemovalCause.COLLECTED;
-        } else if (hasExpired(n, now[0])) {
-          cause[0] = RemovalCause.EXPIRED;
+        if ((nodeKey[0] == null) || (oldValue[0] == null)) { /*key/value特性*/
+          cause[0] = RemovalCause.COLLECTED; // gc
+        } else if (hasExpired(n, now[0])) { /*expire特性*/
+          cause[0] = RemovalCause.EXPIRED; // expired
         } else {
-          return n;
+          return n; // key value不为空 返回
         }
 
-        writer.delete(nodeKey[0], oldValue[0], cause[0]);
+        writer.delete(nodeKey[0], oldValue[0], cause[0]); // deprecated
+
+        // S3-2、用户逻辑
         newValue[0] = mappingFunction.apply(key);
+
+        // S3-3-1、如果新value为null，移除老node
         if (newValue[0] == null) {
           removed[0] = n;
           n.retire();
           return null;
         }
-        weight[1] = weigher.weigh(key, newValue[0]);
-        n.setValue(newValue[0], valueReferenceQueue());
-        n.setWeight(weight[1]);
 
-        now[0] = expirationTicker().read();
-        setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));
-        setAccessTime(n, now[0]);
-        setWriteTime(n, now[0]);
+        // S3-3-2、如果新value不为null，更新node的value
+        weight[1] = weigher.weigh(key, newValue[0]);
+        n.setValue(newValue[0], valueReferenceQueue()); /*value特性*/
+        n.setWeight(weight[1]); /*weigher特性*/
+
+        now[0] = expirationTicker().read(); /*ticker特性*/
+        setVariableTime(n, expireAfterCreate(key, newValue[0], expiry(), now[0]));/*expire特性*/
+        setAccessTime(n, now[0]);/*expire特性*/
+        setWriteTime(n, now[0]);/*expire/refresh特性*/
         return n;
       }
     });
 
+    // S4 出key/node锁，后续特性处理
+
+    // S4-1 用户mappingFunction返回null，返回null
     if (node == null) {
       if (removed[0] != null) {
         afterWrite(new RemovalTask(removed[0]));
@@ -2453,11 +2554,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       return null;
     }
     if (cause[0] != null) {
-      if (hasRemovalListener()) {
+      if (hasRemovalListener()) { /*listener特性*/
         notifyRemoval(nodeKey[0], oldValue[0], cause[0]);
       }
-      statsCounter().recordEviction(weight[0], cause[0]);
+      statsCounter().recordEviction(weight[0], cause[0]); /*recordStats特性*/
     }
+    // S4-2 老value未过期/gc，这是一次普通读，返回老value
     if (newValue[0] == null) {
       if (!isComputingAsync(node)) {
         tryExpireAfterRead(node, key, oldValue[0], expiry(), now[0]);
@@ -2474,6 +2576,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       afterWrite(new UpdateTask(node, weightedDifference));
     }
 
+    // S4-3 老value过期/gc，用户mappingFunction返回非null，返回新value
     return newValue[0];
   }
 
@@ -2693,6 +2796,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           return (key == null) ? 0 : frequencySketch().frequency(key);
       });
       if (hottest) {
+        // protected.tail -> protected.head -> window/probation.tail(frequency) -> window/probation.head(frequency)
         PeekingIterator<Node<K, V>> secondary = PeekingIterator.comparing(
             accessOrderProbationDeque().descendingIterator(),
             accessOrderWindowDeque().descendingIterator(), comparator);
@@ -3985,10 +4089,13 @@ final class BLCHeader {
      */
     boolean shouldDrainBuffers(boolean delayable) {
       switch (drainStatus()) {
+        // 处于空闲状态，读buffer满了，需要maintenance
         case IDLE:
           return !delayable;
+        // 处于REQUIRED状态，需要maintenance
         case REQUIRED:
           return true;
+        // 已经在处理，不需要
         case PROCESSING_TO_IDLE:
         case PROCESSING_TO_REQUIRED:
           return false;
